@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The frontend uses only the custom check_disk_discovery command, which local application commands are exempt from ACL checks. No core or plugin commands are granted.",
+  "windows": ["main"],
+  "permissions": []
+}
