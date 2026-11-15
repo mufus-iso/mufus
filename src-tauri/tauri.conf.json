@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "mufus",
+  "version": "0.1.0",
+  "identifier": "org.mufus.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [{ "title": "mufus", "width": 800, "height": 600, "minWidth": 480, "minHeight": 420 }],
+    "security": { "csp": "default-src 'self'; style-src 'self'; img-src 'self' asset:; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": { "active": false }
+}
