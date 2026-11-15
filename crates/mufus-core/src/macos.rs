@@ -151,6 +151,51 @@ pub fn screen_external_snapshot(
     Ok(candidates)
 }
 
+/// Collect and screen read-only diskutil metadata on macOS.
+///
+/// The result does not establish complete boot topology or stable device
+/// identity and must not be used to authorize selection or writes.
+///
+/// # Errors
+///
+/// Returns an error if diskutil fails or the observed snapshots are inconsistent.
+#[cfg(target_os = "macos")]
+pub fn collect_external_snapshot() -> Result<Vec<ExternalDiskInfo>, &'static str> {
+    collect_with(|args| {
+        let output = std::process::Command::new("/usr/sbin/diskutil")
+            .args(args)
+            .output()
+            .map_err(|_| "failed to run diskutil")?;
+        if !output.status.success() {
+            return Err("diskutil failed");
+        }
+        Ok(output.stdout)
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn collect_with(
+    mut diskutil: impl FnMut(&[&str]) -> Result<Vec<u8>, &'static str>,
+) -> Result<Vec<ExternalDiskInfo>, &'static str> {
+    let root = diskutil(&["info", "-plist", "/"])?;
+    let apfs = diskutil(&["apfs", "list", "-plist"])?;
+    let initial = diskutil(&["list", "-plist", "external", "physical"])?;
+    let mut disk_info = BTreeMap::new();
+    for id in external_whole_disk_ids(&initial)? {
+        let info = diskutil(&["info", "-plist", &id])?;
+        disk_info.insert(id, info);
+    }
+    let final_list = diskutil(&["list", "-plist", "external", "physical"])?;
+    let final_apfs = diskutil(&["apfs", "list", "-plist"])?;
+    let final_root = diskutil(&["info", "-plist", "/"])?;
+    if root_apfs_store_parents(&root)? != root_apfs_store_parents(&final_root)?
+        || apfs_store_parents(&apfs)? != apfs_store_parents(&final_apfs)?
+    {
+        return Err("APFS topology changed");
+    }
+    screen_external_snapshot(&initial, &final_list, &root, &apfs, &disk_info)
+}
+
 /// Parse `diskutil info -plist` for an expected whole disk.
 ///
 /// The result alone does not establish system topology or device identity.
@@ -237,8 +282,8 @@ pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static
 #[cfg(test)]
 mod tests {
     use super::{
-        apfs_store_parents, external_disk_info, external_whole_disk_ids, root_apfs_store_parents,
-        screen_external_snapshot, ExternalDiskInfo,
+        apfs_store_parents, collect_with, external_disk_info, external_whole_disk_ids,
+        root_apfs_store_parents, screen_external_snapshot, ExternalDiskInfo,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -252,6 +297,52 @@ mod tests {
             <key>APFSPhysicalStores</key><array>{stores}</array>
             </dict></plist>"#
         )
+    }
+
+    #[test]
+    fn collector_rejects_changed_apfs_topology_and_command_failures() {
+        let root_info = root("<dict><key>APFSPhysicalStore</key><string>disk0s2</string></dict>");
+        let apfs = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>Containers</key><array>
+            <dict><key>PhysicalStores</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk0s2</string></dict>
+            </array></dict></array></dict></plist>"#;
+        let empty = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>WholeDisks</key><array/><key>AllDisksAndPartitions</key><array/>
+            </dict></plist>"#;
+        assert_eq!(
+            collect_with(|args| match args {
+                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+                ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                _ => Err("unexpected command"),
+            }),
+            Ok(Vec::new())
+        );
+        let mut apfs_calls = 0;
+        let result = collect_with(|args| match args {
+            ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+            ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+            ["apfs", "list", "-plist"] => {
+                apfs_calls += 1;
+                if apfs_calls == 1 {
+                    Ok(apfs.to_vec())
+                } else {
+                    Ok(String::from_utf8_lossy(apfs)
+                        .replace("disk0s2", "disk1s2")
+                        .into_bytes())
+                }
+            }
+            _ => Err("unexpected command"),
+        });
+        assert_eq!(result, Err("APFS topology changed"));
+        assert!(collect_with(|_| Err("diskutil failed")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a macOS host with a supported APFS root"]
+    fn reads_live_diskutil_snapshot() {
+        assert!(super::collect_external_snapshot().is_ok());
     }
 
     #[test]
