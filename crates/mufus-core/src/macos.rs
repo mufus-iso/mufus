@@ -228,6 +228,11 @@ fn collect_with(
         return Err("selected boot device changed");
     }
     let final_boot_info = diskutil(&["info", "-plist", &boot_after])?;
+    if volume_uuid(&root)? != volume_uuid(&final_root)?
+        || volume_uuid(&boot_info)? != volume_uuid(&final_boot_info)?
+    {
+        return Err("APFS volume changed");
+    }
     if root_apfs_store_ids(&root)? != root_apfs_store_ids(&final_root)?
         || apfs_store_ids(&apfs)? != apfs_store_ids(&final_apfs)?
         || boot_apfs_store_ids(&boot_info, &boot)? != boot_apfs_store_ids(&final_boot_info, &boot)?
@@ -328,6 +333,29 @@ fn selected_boot_id(data: &[u8]) -> Result<String, &'static str> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn volume_uuid(data: &[u8]) -> Result<String, &'static str> {
+    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let uuid = value
+        .as_dictionary()
+        .and_then(|info| info.get("VolumeUUID"))
+        .and_then(plist::Value::as_string)
+        .ok_or("missing volume UUID")?;
+    if uuid.len() != 36
+        || !uuid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+        || uuid.bytes().all(|byte| byte == b'0' || byte == b'-')
+    {
+        return Err("invalid volume UUID");
+    }
+    Ok(uuid.to_ascii_uppercase())
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn boot_apfs_store_ids(data: &[u8], expected: &str) -> Result<BTreeSet<String>, &'static str> {
     let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
     let info = value.as_dictionary().ok_or("invalid boot information")?;
@@ -369,7 +397,8 @@ fn info_apfs_store_ids(info: &plist::Dictionary) -> Result<BTreeSet<String>, &'s
 mod tests {
     use super::{
         apfs_store_parents, collect_with, external_disk_info, external_whole_disk_ids,
-        root_apfs_store_parents, screen_external_snapshot, selected_boot_id, ExternalDiskInfo,
+        root_apfs_store_parents, screen_external_snapshot, selected_boot_id, volume_uuid,
+        ExternalDiskInfo,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -378,6 +407,7 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
             <plist version="1.0"><dict>
             <key>MountPoint</key><string>/</string>
+            <key>VolumeUUID</key><string>11111111-1111-1111-1111-111111111111</string>
             <key>FilesystemType</key><string>apfs</string>
             <key>RAIDMaster</key><false/><key>RAIDSlice</key><false/>
             <key>APFSPhysicalStores</key><array>{stores}</array>
@@ -481,6 +511,85 @@ mod tests {
         assert!(selected_boot_id(b"bsdp://255.255.255.255").is_err());
         assert!(selected_boot_id(b"/dev/disk3s1;command").is_err());
         assert!(selected_boot_id(b"/dev/disk3s1s1").is_err());
+    }
+
+    #[test]
+    fn collector_rejects_changed_or_missing_volume_identity() {
+        let original = root("<dict><key>APFSPhysicalStore</key><string>disk0s2</string></dict>");
+        let changed = original.replace(
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        );
+        let apfs = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>Containers</key><array>
+            <dict><key>PhysicalStores</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk0s2</string></dict>
+            </array></dict></array></dict></plist>"#;
+        let empty = include_bytes!("../tests/fixtures/diskutil-empty.plist");
+        for change_root in [true, false] {
+            let mut root_reads = 0;
+            let mut boot_reads = 0;
+            let result = collect_with(
+                |args| match args {
+                    ["info", "-plist", "/"] => {
+                        root_reads += 1;
+                        Ok(if change_root && root_reads == 2 {
+                            &changed
+                        } else {
+                            &original
+                        }
+                        .as_bytes()
+                        .to_vec())
+                    }
+                    ["info", "-plist", "disk3s1"] => {
+                        boot_reads += 1;
+                        Ok(boot_info(if !change_root && boot_reads == 2 {
+                            &changed
+                        } else {
+                            &original
+                        })
+                        .into_bytes())
+                    }
+                    ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+                    ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                    _ => Err("unexpected command"),
+                },
+                || Ok(b"/dev/disk3s1\n".to_vec()),
+            );
+            assert_eq!(result, Err("APFS volume changed"));
+        }
+        assert!(volume_uuid(
+            original
+                .replace("11111111-1111-1111-1111-111111111111", "")
+                .as_bytes()
+        )
+        .is_err());
+        assert!(volume_uuid(
+            original
+                .replace(
+                    "<key>VolumeUUID</key><string>11111111-1111-1111-1111-111111111111</string>",
+                    ""
+                )
+                .as_bytes()
+        )
+        .is_err());
+        assert!(volume_uuid(
+            original
+                .replace(
+                    "11111111-1111-1111-1111-111111111111",
+                    "00000000-0000-0000-0000-000000000000"
+                )
+                .as_bytes()
+        )
+        .is_err());
+        assert!(volume_uuid(
+            original
+                .replace(
+                    "11111111-1111-1111-1111-111111111111",
+                    "11111111-1111-1111-1111-11111111111z"
+                )
+                .as_bytes()
+        )
+        .is_err());
     }
 
     #[test]
