@@ -199,6 +199,12 @@ fn collect_with(
         let info = diskutil(&["info", "-plist", &id])?;
         disk_info.insert(id, info);
     }
+    for (id, first) in &disk_info {
+        let second = diskutil(&["info", "-plist", id])?;
+        if external_disk_info(first, id)? != external_disk_info(&second, id)? {
+            return Err("external disk metadata changed");
+        }
+    }
     let final_list = diskutil(&["list", "-plist", "external", "physical"])?;
     let final_apfs = diskutil(&["apfs", "list", "-plist"])?;
     let final_root = diskutil(&["info", "-plist", "/"])?;
@@ -392,6 +398,26 @@ mod tests {
             ("disk4".into(), info("disk4")),
             ("disk5".into(), info("disk5")),
         ]);
+        let mut disk5_reads = 0;
+        let changed_info = collect_with(|args| match args {
+            ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+            ["list", "-plist", "external", "physical"] => Ok(list.to_vec()),
+            ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+            ["info", "-plist", "disk4"] => Ok(info("disk4")),
+            ["info", "-plist", "disk5"] => {
+                disk5_reads += 1;
+                let bytes = info("disk5");
+                if disk5_reads == 1 {
+                    Ok(bytes)
+                } else {
+                    Ok(String::from_utf8_lossy(&bytes)
+                        .replace("Example", "Other")
+                        .into_bytes())
+                }
+            }
+            _ => Err("unexpected command"),
+        });
+        assert_eq!(changed_info, Err("external disk metadata changed"));
         let result = screen_external_snapshot(list, list, root_info.as_bytes(), apfs, &disks);
         assert_eq!(
             result.map(|disks| disks
