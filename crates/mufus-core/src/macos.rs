@@ -35,13 +35,20 @@ fn store_parent(id: &str) -> Result<String, &'static str> {
 ///
 /// Returns an error for malformed containers or ambiguous store identifiers.
 pub fn apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
+    apfs_store_ids(data)?
+        .iter()
+        .map(|id| store_parent(id))
+        .collect()
+}
+
+fn apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
     let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
     let containers = value
         .as_dictionary()
         .and_then(|list| list.get("Containers"))
         .and_then(plist::Value::as_array)
         .ok_or("missing APFS containers")?;
-    let mut parents = BTreeSet::new();
+    let mut identifiers = BTreeSet::new();
     for container in containers {
         let stores = container
             .as_dictionary()
@@ -55,10 +62,13 @@ pub fn apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static str>
                 .and_then(|store| store.get("DeviceIdentifier"))
                 .and_then(plist::Value::as_string)
                 .ok_or("invalid APFS physical store")?;
-            parents.insert(store_parent(identifier)?);
+            store_parent(identifier)?;
+            if !identifiers.insert(identifier.to_owned()) {
+                return Err("duplicate APFS physical store");
+            }
         }
     }
-    Ok(parents)
+    Ok(identifiers)
 }
 
 /// Parse whole disk identifiers from `diskutil list -plist external physical`.
@@ -132,11 +142,15 @@ pub fn screen_external_snapshot(
     if initial != external_whole_disk_ids(final_list)? {
         return Err("external disk list changed");
     }
-    let root = root_apfs_store_parents(root_info)?;
-    let protected = apfs_store_parents(apfs_list)?;
-    if !root.is_subset(&protected) {
+    let root = root_apfs_store_ids(root_info)?;
+    let stores = apfs_store_ids(apfs_list)?;
+    if !root.is_subset(&stores) {
         return Err("inconsistent APFS root topology");
     }
+    let protected: BTreeSet<_> = stores
+        .iter()
+        .map(|id| store_parent(id))
+        .collect::<Result<_, _>>()?;
     if disk_info.len() != initial.len() || disk_info.keys().any(|id| !initial.contains(id)) {
         return Err("incomplete disk metadata");
     }
@@ -188,8 +202,8 @@ fn collect_with(
     let final_list = diskutil(&["list", "-plist", "external", "physical"])?;
     let final_apfs = diskutil(&["apfs", "list", "-plist"])?;
     let final_root = diskutil(&["info", "-plist", "/"])?;
-    if root_apfs_store_parents(&root)? != root_apfs_store_parents(&final_root)?
-        || apfs_store_parents(&apfs)? != apfs_store_parents(&final_apfs)?
+    if root_apfs_store_ids(&root)? != root_apfs_store_ids(&final_root)?
+        || apfs_store_ids(&apfs)? != apfs_store_ids(&final_apfs)?
     {
         return Err("APFS topology changed");
     }
@@ -252,6 +266,13 @@ pub fn external_disk_info(data: &[u8], expected: &str) -> Result<ExternalDiskInf
 /// Returns an error for malformed metadata, unsupported topology, or an
 /// invalid physical store identifier.
 pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
+    root_apfs_store_ids(data)?
+        .iter()
+        .map(|id| store_parent(id))
+        .collect()
+}
+
+fn root_apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
     let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
     let info = value.as_dictionary().ok_or("invalid disk information")?;
     if info.get("MountPoint").and_then(plist::Value::as_string) != Some("/")
@@ -274,7 +295,8 @@ pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static
                 .and_then(|store| store.get("APFSPhysicalStore"))
                 .and_then(plist::Value::as_string)
                 .ok_or("invalid APFS physical store")?;
-            store_parent(id)
+            store_parent(id)?;
+            Ok(id.to_owned())
         })
         .collect()
 }
@@ -328,7 +350,7 @@ mod tests {
                     Ok(apfs.to_vec())
                 } else {
                     Ok(String::from_utf8_lossy(apfs)
-                        .replace("disk0s2", "disk1s2")
+                        .replace("disk0s2", "disk0s3")
                         .into_bytes())
                 }
             }
@@ -393,7 +415,7 @@ mod tests {
         assert!(screen_external_snapshot(
             list,
             list,
-            root_info.replace("disk4s1", "disk0s2").as_bytes(),
+            root_info.replace("disk4s1", "disk4s2").as_bytes(),
             apfs,
             &disks
         )
