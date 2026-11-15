@@ -3,6 +3,55 @@
 use std::collections::BTreeSet;
 use std::io::Cursor;
 
+fn valid_whole_disk_id(id: &str) -> bool {
+    id.strip_prefix("disk").is_some_and(|number| {
+        !(number.is_empty() || number.len() > 1 && number.starts_with('0'))
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Parse whole disk identifiers from `diskutil list -plist external physical`.
+///
+/// The list is an untrusted snapshot, not proof that a disk is safe to use.
+///
+/// # Errors
+///
+/// Returns an error for invalid, duplicate, or inconsistent disk identifiers.
+pub fn external_whole_disk_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
+    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let list = value.as_dictionary().ok_or("invalid disk list")?;
+    let disks = list
+        .get("WholeDisks")
+        .and_then(plist::Value::as_array)
+        .ok_or("missing whole disk list")?;
+    let entries = list
+        .get("AllDisksAndPartitions")
+        .and_then(plist::Value::as_array)
+        .ok_or("missing disk entries")?;
+    let mut identifiers = BTreeSet::new();
+    for disk in disks {
+        let id = disk.as_string().ok_or("invalid disk identifier")?;
+        if !valid_whole_disk_id(id) || !identifiers.insert(id.to_owned()) {
+            return Err("invalid or duplicate disk identifier");
+        }
+    }
+    let mut entry_ids = BTreeSet::new();
+    for entry in entries {
+        let id = entry
+            .as_dictionary()
+            .and_then(|entry| entry.get("DeviceIdentifier"))
+            .and_then(plist::Value::as_string)
+            .ok_or("invalid disk entry")?;
+        if !valid_whole_disk_id(id) || !entry_ids.insert(id.to_owned()) {
+            return Err("invalid or duplicate disk entry");
+        }
+    }
+    if identifiers != entry_ids {
+        return Err("inconsistent disk list");
+    }
+    Ok(identifiers)
+}
+
 /// Metadata from a whole external physical disk, not an authorization to write.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExternalDiskInfo {
@@ -21,11 +70,7 @@ pub struct ExternalDiskInfo {
 /// Returns an error when the metadata is invalid, inconsistent, or does not
 /// describe a whole external physical disk.
 pub fn external_disk_info(data: &[u8], expected: &str) -> Result<ExternalDiskInfo, &'static str> {
-    let number = expected
-        .strip_prefix("disk")
-        .filter(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
-        .ok_or("invalid disk identifier")?;
-    if number.len() > 1 && number.starts_with('0') {
+    if !valid_whole_disk_id(expected) {
         return Err("invalid disk identifier");
     }
     let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
@@ -112,7 +157,10 @@ pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static
 
 #[cfg(test)]
 mod tests {
-    use super::{external_disk_info, root_apfs_store_parents, ExternalDiskInfo};
+    use super::{
+        external_disk_info, external_whole_disk_ids, root_apfs_store_parents, ExternalDiskInfo,
+    };
+    use std::collections::BTreeSet;
 
     fn root(stores: &str) -> String {
         format!(
@@ -124,6 +172,46 @@ mod tests {
             <key>APFSPhysicalStores</key><array>{stores}</array>
             </dict></plist>"#
         )
+    }
+
+    #[test]
+    fn validates_external_disk_snapshot_consistency() {
+        let list = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict>
+        <key>WholeDisks</key><array><string>disk4</string></array>
+        <key>AllDisksAndPartitions</key><array>
+        <dict><key>DeviceIdentifier</key><string>disk4</string></dict>
+        </array></dict></plist>"#;
+        assert_eq!(
+            external_whole_disk_ids(list.as_bytes()),
+            Ok(["disk4".into()].into())
+        );
+        assert!(external_whole_disk_ids(
+            list.replace(
+                "<string>disk4</string></array>",
+                "<string>disk5</string></array>"
+            )
+            .as_bytes()
+        )
+        .is_err());
+        assert!(external_whole_disk_ids(
+            list.replace(
+                "<string>disk4</string></array>",
+                "<string>disk4</string><string>disk4</string></array>"
+            )
+            .as_bytes()
+        )
+        .is_err());
+        assert!(external_whole_disk_ids(list.replace("disk4", "disk04").as_bytes()).is_err());
+        assert!(external_whole_disk_ids(list.replace("disk4", "disk4s1").as_bytes()).is_err());
+        assert!(external_whole_disk_ids(b"not a plist").is_err());
+        let empty = list
+            .replace("<string>disk4</string>", "")
+            .replace("<dict><key>DeviceIdentifier</key></dict>", "");
+        assert_eq!(
+            external_whole_disk_ids(empty.as_bytes()),
+            Ok(BTreeSet::new())
+        );
     }
 
     #[test]
