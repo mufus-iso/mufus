@@ -2,7 +2,7 @@
 
 An experimental, unofficial desktop application for preparing boot media. The project is in its initial development stage: a preliminary read-only disk check is available on macOS; **device selection, privileged operations and disk writing are not implemented**.
 
-The disk check uses `diskutil` and `bless --getBoot` to inspect the root and selected startup volumes. It requires their APFS stores to be identifiable; unavailable commands, unsupported layouts or inconsistent metadata cause the check to fail. A successful check does not establish complete boot topology or authorize disk writes.
+The disk check uses `diskutil` and `bless --getBoot` to inspect the root and selected startup volumes. It requires their APFS stores to be identifiable; unavailable commands, unsupported layouts, inconsistent metadata, command output above 8 MiB, or a command that does not finish within 10 seconds cause the check to fail. A successful check does not establish complete boot topology or authorize disk writes.
 
 ## Development
 

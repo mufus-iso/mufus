@@ -2,6 +2,81 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+#[cfg(any(target_os = "macos", test))]
+use std::io::Read;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+
+// shortcut: metadata above 8 MiB is rejected; revisit if valid systems need more.
+const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn parse_plist(data: &[u8]) -> Result<plist::Value, &'static str> {
+    if u64::try_from(data.len()).map_err(|_| "metadata too large")? > MAX_METADATA_BYTES {
+        return Err("metadata too large");
+    }
+    plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_metadata(reader: impl std::io::Read) -> Result<Vec<u8>, &'static str> {
+    let mut data = Vec::new();
+    reader
+        .take(MAX_METADATA_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| "failed to read metadata")?;
+    if u64::try_from(data.len()).map_err(|_| "metadata too large")? > MAX_METADATA_BYTES {
+        return Err("metadata too large");
+    }
+    Ok(data)
+}
+
+#[cfg(target_os = "macos")]
+fn run_metadata_command(command: &mut std::process::Command) -> Result<Vec<u8>, &'static str> {
+    run_metadata_command_with_timeout(command, METADATA_TIMEOUT)
+}
+
+#[cfg(target_os = "macos")]
+fn run_metadata_command_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, &'static str> {
+    use std::process::Stdio;
+    use wait_timeout::ChildExt;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "failed to run metadata command")?;
+    let stdout = child.stdout.take().ok_or("missing command output")?;
+    let deadline = std::time::Instant::now() + timeout;
+
+    std::thread::scope(|scope| -> Result<Vec<u8>, &'static str> {
+        let reader = scope.spawn(|| read_metadata(stdout));
+        let status = match child
+            .wait_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("metadata command timed out");
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("failed to wait for metadata command");
+            }
+        };
+        if !status.success() {
+            return Err("metadata command failed");
+        }
+        reader.join().unwrap_or(Err("metadata reader panicked"))
+    })
+}
 
 fn valid_whole_disk_id(id: &str) -> bool {
     id.strip_prefix("disk").is_some_and(|number| {
@@ -42,7 +117,7 @@ pub fn apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static str>
 }
 
 fn apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
-    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let value = parse_plist(data)?;
     let containers = value
         .as_dictionary()
         .and_then(|list| list.get("Containers"))
@@ -79,7 +154,7 @@ fn apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
 ///
 /// Returns an error for invalid, duplicate, or inconsistent disk identifiers.
 pub fn external_whole_disk_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
-    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let value = parse_plist(data)?;
     let list = value.as_dictionary().ok_or("invalid disk list")?;
     let disks = list
         .get("WholeDisks")
@@ -176,26 +251,8 @@ pub fn screen_external_snapshot(
 #[cfg(target_os = "macos")]
 pub fn collect_external_snapshot() -> Result<Vec<ExternalDiskInfo>, &'static str> {
     collect_with(
-        |args| {
-            let output = std::process::Command::new("/usr/sbin/diskutil")
-                .args(args)
-                .output()
-                .map_err(|_| "failed to run diskutil")?;
-            if !output.status.success() {
-                return Err("diskutil failed");
-            }
-            Ok(output.stdout)
-        },
-        || {
-            let output = std::process::Command::new("/usr/sbin/bless")
-                .arg("--getBoot")
-                .output()
-                .map_err(|_| "failed to run bless")?;
-            if !output.status.success() {
-                return Err("bless failed");
-            }
-            Ok(output.stdout)
-        },
+        |args| run_metadata_command(std::process::Command::new("/usr/sbin/diskutil").args(args)),
+        || run_metadata_command(std::process::Command::new("/usr/sbin/bless").arg("--getBoot")),
     )
 }
 
@@ -257,7 +314,7 @@ pub fn external_disk_info(data: &[u8], expected: &str) -> Result<ExternalDiskInf
     if !valid_whole_disk_id(expected) {
         return Err("invalid disk identifier");
     }
-    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let value = parse_plist(data)?;
     let info = value.as_dictionary().ok_or("invalid disk information")?;
     let string = |key: &str| info.get(key).and_then(plist::Value::as_string);
     let boolean = |key: &str| info.get(key).and_then(plist::Value::as_boolean);
@@ -308,7 +365,7 @@ pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static
 }
 
 fn root_apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
-    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let value = parse_plist(data)?;
     let info = value.as_dictionary().ok_or("invalid disk information")?;
     if info.get("MountPoint").and_then(plist::Value::as_string) != Some("/")
         || info.get("FilesystemType").and_then(plist::Value::as_string) != Some("apfs")
@@ -334,7 +391,7 @@ fn selected_boot_id(data: &[u8]) -> Result<String, &'static str> {
 
 #[cfg(any(target_os = "macos", test))]
 fn volume_uuid(data: &[u8]) -> Result<String, &'static str> {
-    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let value = parse_plist(data)?;
     let uuid = value
         .as_dictionary()
         .and_then(|info| info.get("VolumeUUID"))
@@ -357,7 +414,7 @@ fn volume_uuid(data: &[u8]) -> Result<String, &'static str> {
 
 #[cfg(any(target_os = "macos", test))]
 fn boot_apfs_store_ids(data: &[u8], expected: &str) -> Result<BTreeSet<String>, &'static str> {
-    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let value = parse_plist(data)?;
     let info = value.as_dictionary().ok_or("invalid boot information")?;
     if info
         .get("DeviceIdentifier")
@@ -397,10 +454,11 @@ fn info_apfs_store_ids(info: &plist::Dictionary) -> Result<BTreeSet<String>, &'s
 mod tests {
     use super::{
         apfs_store_parents, collect_with, external_disk_info, external_whole_disk_ids,
-        root_apfs_store_parents, screen_external_snapshot, selected_boot_id, volume_uuid,
-        ExternalDiskInfo,
+        read_metadata, root_apfs_store_parents, screen_external_snapshot, selected_boot_id,
+        volume_uuid, ExternalDiskInfo, MAX_METADATA_BYTES,
     };
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Read;
 
     fn root(stores: &str) -> String {
         format!(
@@ -420,6 +478,54 @@ mod tests {
             "<key>MountPoint</key>",
             "<key>DeviceIdentifier</key><string>disk3s1</string><key>MountPoint</key>",
         )
+    }
+
+    #[test]
+    fn rejects_metadata_over_the_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let at_limit = read_metadata(std::io::repeat(b'x').take(MAX_METADATA_BYTES))?;
+        assert_eq!(u64::try_from(at_limit.len())?, MAX_METADATA_BYTES);
+        assert_eq!(
+            read_metadata(std::io::repeat(b'x')),
+            Err("metadata too large")
+        );
+        let mut oversized = at_limit;
+        oversized.push(b'x');
+        assert_eq!(
+            external_whole_disk_ids(&oversized),
+            Err("metadata too large")
+        );
+        assert_eq!(
+            external_whole_disk_ids(b"not a plist"),
+            Err("invalid plist")
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bounds_and_reaps_its_own_metadata_process() {
+        let mut command = std::process::Command::new("/usr/bin/yes");
+        assert!(super::run_metadata_command(&mut command).is_err());
+        let mut command = std::process::Command::new("/usr/bin/printf");
+        command.arg("metadata");
+        assert_eq!(
+            super::run_metadata_command(&mut command),
+            Ok(b"metadata".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kills_metadata_processes_that_exceed_the_timeout() {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        assert_eq!(
+            super::run_metadata_command_with_timeout(
+                &mut command,
+                std::time::Duration::from_millis(50)
+            ),
+            Err("metadata command timed out")
+        );
     }
 
     #[test]
