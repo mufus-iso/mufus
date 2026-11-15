@@ -27,6 +27,10 @@ cargo test --locked --workspace
 cargo deny --locked --all-features check --hide-inclusion-graph
 ```
 
+CI pins its GitHub Actions to full-length SHAs.
+
+The Tauri window declares an explicit capability with no permissions; the frontend calls only the local `check_disk_discovery` command and is granted no core or plugin commands.
+
 The frontend temporarily overrides `typescript-estree`'s `minimatch` dependency to version 11 to address GHSA-g3hv-75wg-m249. Remove the override when upstream supports a patched version; the override crosses the upstream major-version range and must be rechecked when dependencies change.
 
 `cargo-deny` checks Rust advisories, dependency sources, licenses and duplicate versions; install it separately to run the check locally. The current Tauri dependency graph includes MPL-2.0 crates: distributing binaries requires reviewing and fulfilling their applicable license and source-availability obligations. The two documented GTK3 advisory exceptions in `deny.toml` must be revisited before Linux support and when upstream updates.
