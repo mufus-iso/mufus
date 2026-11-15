@@ -1,6 +1,6 @@
 //! Parsing of macOS disk metadata. This module does not authorize disk writes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
 fn valid_whole_disk_id(id: &str) -> bool {
@@ -112,6 +112,45 @@ pub struct ExternalDiskInfo {
     pub size_bytes: u64,
 }
 
+/// Screen an external disk snapshot against known APFS root dependencies.
+///
+/// This is only preliminary screening: matching snapshots do not prove device
+/// identity or complete boot topology, and the result must not authorize
+/// device selection or writes.
+///
+/// # Errors
+///
+/// Returns an error if the snapshot is inconsistent or required data is absent.
+pub fn screen_external_snapshot(
+    initial_list: &[u8],
+    final_list: &[u8],
+    root_info: &[u8],
+    apfs_list: &[u8],
+    disk_info: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<ExternalDiskInfo>, &'static str> {
+    let initial = external_whole_disk_ids(initial_list)?;
+    if initial != external_whole_disk_ids(final_list)? {
+        return Err("external disk list changed");
+    }
+    let root = root_apfs_store_parents(root_info)?;
+    let protected = apfs_store_parents(apfs_list)?;
+    if !root.is_subset(&protected) {
+        return Err("inconsistent APFS root topology");
+    }
+    if disk_info.len() != initial.len() || disk_info.keys().any(|id| !initial.contains(id)) {
+        return Err("incomplete disk metadata");
+    }
+    let mut candidates = Vec::new();
+    for id in &initial {
+        let info = disk_info.get(id).ok_or("missing disk metadata")?;
+        let disk = external_disk_info(info, id)?;
+        if !protected.contains(id) {
+            candidates.push(disk);
+        }
+    }
+    Ok(candidates)
+}
+
 /// Parse `diskutil info -plist` for an expected whole disk.
 ///
 /// The result alone does not establish system topology or device identity.
@@ -199,9 +238,9 @@ pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static
 mod tests {
     use super::{
         apfs_store_parents, external_disk_info, external_whole_disk_ids, root_apfs_store_parents,
-        ExternalDiskInfo,
+        screen_external_snapshot, ExternalDiskInfo,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn root(stores: &str) -> String {
         format!(
@@ -213,6 +252,61 @@ mod tests {
             <key>APFSPhysicalStores</key><array>{stores}</array>
             </dict></plist>"#
         )
+    }
+
+    #[test]
+    fn screens_known_apfs_dependencies_and_rejects_changed_snapshots() {
+        let list = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>WholeDisks</key><array><string>disk4</string><string>disk5</string></array>
+            <key>AllDisksAndPartitions</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk4</string></dict>
+            <dict><key>DeviceIdentifier</key><string>disk5</string></dict>
+            </array></dict></plist>"#;
+        let root_info = root("<dict><key>APFSPhysicalStore</key><string>disk4s1</string></dict>");
+        let apfs = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>Containers</key><array>
+            <dict><key>PhysicalStores</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+            </array></dict></array></dict></plist>"#;
+        let info = |id| {
+            format!(r#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>DeviceIdentifier</key><string>{id}</string><key>ParentWholeDisk</key><string>{id}</string>
+            <key>VirtualOrPhysical</key><string>Physical</string><key>WholeDisk</key><true/>
+            <key>Internal</key><false/><key>RAIDMaster</key><false/><key>RAIDSlice</key><false/>
+            <key>MediaName</key><string>Example</string><key>BusProtocol</key><string>USB</string>
+            <key>TotalSize</key><integer>1024</integer></dict></plist>"#).into_bytes()
+        };
+        let disks = BTreeMap::from([
+            ("disk4".into(), info("disk4")),
+            ("disk5".into(), info("disk5")),
+        ]);
+        let result = screen_external_snapshot(list, list, root_info.as_bytes(), apfs, &disks);
+        assert_eq!(
+            result.map(|disks| disks
+                .into_iter()
+                .map(|disk| disk.identifier)
+                .collect::<Vec<_>>()),
+            Ok(vec!["disk5".into()])
+        );
+        let changed = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>WholeDisks</key><array><string>disk4</string></array>
+            <key>AllDisksAndPartitions</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk4</string></dict>
+            </array></dict></plist>"#;
+        assert!(
+            screen_external_snapshot(list, changed, root_info.as_bytes(), apfs, &disks).is_err()
+        );
+        assert!(
+            screen_external_snapshot(list, list, root_info.as_bytes(), apfs, &BTreeMap::new())
+                .is_err()
+        );
+        assert!(screen_external_snapshot(
+            list,
+            list,
+            root_info.replace("disk4s1", "disk0s2").as_bytes(),
+            apfs,
+            &disks
+        )
+        .is_err());
     }
 
     #[test]
