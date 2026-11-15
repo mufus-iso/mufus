@@ -1,6 +1,6 @@
 # mufus
 
-An experimental, unofficial desktop application for preparing boot media. The project is in its initial development stage: **device discovery, privileged operations and disk writing are not implemented**.
+An experimental, unofficial desktop application for preparing boot media. The project is in its initial development stage: a preliminary read-only disk check is available on macOS; **device selection, privileged operations and disk writing are not implemented**.
 
 ## Development
 
@@ -16,6 +16,7 @@ The Rust toolchain is selected by `rust-toolchain.toml`. Checks:
 ```sh
 npm run lint --prefix frontend
 npm run format:check --prefix frontend
+npm run test --prefix frontend
 npm run build --prefix frontend
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

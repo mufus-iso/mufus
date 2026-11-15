@@ -61,6 +61,28 @@ h2 {
 .status p {
   margin-bottom: 0;
 }
+button {
+  margin-top: 20px;
+  padding: 10px 16px;
+  border: 1px solid #285b51;
+  border-radius: 4px;
+  background: #285b51;
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: #19463e;
+}
+button:focus-visible {
+  outline: 3px solid #498c80;
+  outline-offset: 3px;
+}
+button:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
 .note {
   margin-top: 24px;
   font-size: 13px;

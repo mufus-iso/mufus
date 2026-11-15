@@ -10,5 +10,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+mufus-core = { path = "../crates/mufus-core" }
+
 [lints]
 workspace = true

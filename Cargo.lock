@@ -1848,6 +1848,7 @@ dependencies = [
 name = "mufus"
 version = "0.1.0"
 dependencies = [
+ "mufus-core",
  "tauri",
  "tauri-build",
 ]

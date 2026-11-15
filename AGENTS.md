@@ -3,7 +3,7 @@
 ## Project status and architecture
 
 - Before working, read `.main-plan-docs.md` if available: it contains the detailed roadmap and security model. It is globally Git-ignored and may be absent in other clones; do not force-add it.
-- The repository contains an initial Cargo workspace and Tauri/React shell; device discovery, privileged operations, and disk writing are not implemented. See `README.md` for setup and checks; later stages in the plan remain targets.
+- The repository contains an initial Cargo workspace and Tauri/React shell with a preliminary read-only macOS disk check; device selection, privileged operations, and disk writing are not implemented. See `README.md` for setup and checks; later stages in the plan remain targets.
 - The planned app is macOS-first, using Tauri 2, React, and TypeScript, with a UI-independent Rust core and a short-lived privileged helper. Work on the stage relevant to the request; do not present future features as implemented.
 - Raw image writing copies an existing disk layout; it does not make an image bootable. Partition and filesystem options belong to a separate formatting mode, not the raw-write UI.
 
