@@ -175,22 +175,37 @@ pub fn screen_external_snapshot(
 /// Returns an error if diskutil fails or the observed snapshots are inconsistent.
 #[cfg(target_os = "macos")]
 pub fn collect_external_snapshot() -> Result<Vec<ExternalDiskInfo>, &'static str> {
-    collect_with(|args| {
-        let output = std::process::Command::new("/usr/sbin/diskutil")
-            .args(args)
-            .output()
-            .map_err(|_| "failed to run diskutil")?;
-        if !output.status.success() {
-            return Err("diskutil failed");
-        }
-        Ok(output.stdout)
-    })
+    collect_with(
+        |args| {
+            let output = std::process::Command::new("/usr/sbin/diskutil")
+                .args(args)
+                .output()
+                .map_err(|_| "failed to run diskutil")?;
+            if !output.status.success() {
+                return Err("diskutil failed");
+            }
+            Ok(output.stdout)
+        },
+        || {
+            let output = std::process::Command::new("/usr/sbin/bless")
+                .arg("--getBoot")
+                .output()
+                .map_err(|_| "failed to run bless")?;
+            if !output.status.success() {
+                return Err("bless failed");
+            }
+            Ok(output.stdout)
+        },
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn collect_with(
     mut diskutil: impl FnMut(&[&str]) -> Result<Vec<u8>, &'static str>,
+    mut selected_boot: impl FnMut() -> Result<Vec<u8>, &'static str>,
 ) -> Result<Vec<ExternalDiskInfo>, &'static str> {
+    let boot = selected_boot_id(&selected_boot()?)?;
+    let boot_info = diskutil(&["info", "-plist", &boot])?;
     let root = diskutil(&["info", "-plist", "/"])?;
     let apfs = diskutil(&["apfs", "list", "-plist"])?;
     let initial = diskutil(&["list", "-plist", "external", "physical"])?;
@@ -208,10 +223,19 @@ fn collect_with(
     let final_list = diskutil(&["list", "-plist", "external", "physical"])?;
     let final_apfs = diskutil(&["apfs", "list", "-plist"])?;
     let final_root = diskutil(&["info", "-plist", "/"])?;
+    let boot_after = selected_boot_id(&selected_boot()?)?;
+    if boot != boot_after {
+        return Err("selected boot device changed");
+    }
+    let final_boot_info = diskutil(&["info", "-plist", &boot_after])?;
     if root_apfs_store_ids(&root)? != root_apfs_store_ids(&final_root)?
         || apfs_store_ids(&apfs)? != apfs_store_ids(&final_apfs)?
+        || boot_apfs_store_ids(&boot_info, &boot)? != boot_apfs_store_ids(&final_boot_info, &boot)?
     {
         return Err("APFS topology changed");
+    }
+    if !boot_apfs_store_ids(&boot_info, &boot)?.is_subset(&apfs_store_ids(&apfs)?) {
+        return Err("inconsistent selected boot topology");
     }
     screen_external_snapshot(&initial, &final_list, &root, &apfs, &disk_info)
 }
@@ -288,6 +312,39 @@ fn root_apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
     {
         return Err("unsupported root topology");
     }
+    info_apfs_store_ids(info)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn selected_boot_id(data: &[u8]) -> Result<String, &'static str> {
+    let path = std::str::from_utf8(data)
+        .map_err(|_| "invalid selected boot device")?
+        .trim();
+    let id = path
+        .strip_prefix("/dev/")
+        .ok_or("unsupported selected boot device")?;
+    store_parent(id)?;
+    Ok(id.to_owned())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn boot_apfs_store_ids(data: &[u8], expected: &str) -> Result<BTreeSet<String>, &'static str> {
+    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let info = value.as_dictionary().ok_or("invalid boot information")?;
+    if info
+        .get("DeviceIdentifier")
+        .and_then(plist::Value::as_string)
+        != Some(expected)
+        || info.get("FilesystemType").and_then(plist::Value::as_string) != Some("apfs")
+        || info.get("RAIDMaster").and_then(plist::Value::as_boolean) != Some(false)
+        || info.get("RAIDSlice").and_then(plist::Value::as_boolean) != Some(false)
+    {
+        return Err("unsupported selected boot topology");
+    }
+    info_apfs_store_ids(info)
+}
+
+fn info_apfs_store_ids(info: &plist::Dictionary) -> Result<BTreeSet<String>, &'static str> {
     let stores = info
         .get("APFSPhysicalStores")
         .and_then(plist::Value::as_array)
@@ -312,7 +369,7 @@ fn root_apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
 mod tests {
     use super::{
         apfs_store_parents, collect_with, external_disk_info, external_whole_disk_ids,
-        root_apfs_store_parents, screen_external_snapshot, ExternalDiskInfo,
+        root_apfs_store_parents, screen_external_snapshot, selected_boot_id, ExternalDiskInfo,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -328,6 +385,13 @@ mod tests {
         )
     }
 
+    fn boot_info(root_info: &str) -> String {
+        root_info.replace(
+            "<key>MountPoint</key>",
+            "<key>DeviceIdentifier</key><string>disk3s1</string><key>MountPoint</key>",
+        )
+    }
+
     #[test]
     fn collector_rejects_changed_apfs_topology_and_command_failures() {
         let root_info = root("<dict><key>APFSPhysicalStore</key><string>disk0s2</string></dict>");
@@ -339,32 +403,110 @@ mod tests {
             <key>WholeDisks</key><array/><key>AllDisksAndPartitions</key><array/>
             </dict></plist>"#;
         assert_eq!(
-            collect_with(|args| match args {
-                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
-                ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
-                ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
-                _ => Err("unexpected command"),
-            }),
+            collect_with(
+                |args| match args {
+                    ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                    ["info", "-plist", "disk3s1"] => Ok(boot_info(&root_info).into_bytes()),
+                    ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+                    ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                    _ => Err("unexpected command"),
+                },
+                || Ok(b"/dev/disk3s1\n".to_vec())
+            ),
             Ok(Vec::new())
         );
         let mut apfs_calls = 0;
-        let result = collect_with(|args| match args {
-            ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
-            ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
-            ["apfs", "list", "-plist"] => {
-                apfs_calls += 1;
-                if apfs_calls == 1 {
-                    Ok(apfs.to_vec())
-                } else {
-                    Ok(String::from_utf8_lossy(apfs)
-                        .replace("disk0s2", "disk0s3")
-                        .into_bytes())
+        let result = collect_with(
+            |args| match args {
+                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                ["info", "-plist", "disk3s1"] => Ok(boot_info(&root_info).into_bytes()),
+                ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+                ["apfs", "list", "-plist"] => {
+                    apfs_calls += 1;
+                    if apfs_calls == 1 {
+                        Ok(apfs.to_vec())
+                    } else {
+                        Ok(String::from_utf8_lossy(apfs)
+                            .replace("disk0s2", "disk0s3")
+                            .into_bytes())
+                    }
                 }
-            }
-            _ => Err("unexpected command"),
-        });
+                _ => Err("unexpected command"),
+            },
+            || Ok(b"/dev/disk3s1\n".to_vec()),
+        );
         assert_eq!(result, Err("APFS topology changed"));
-        assert!(collect_with(|_| Err("diskutil failed")).is_err());
+        let mut boot_reads = 0;
+        let changed_boot = collect_with(
+            |args| match args {
+                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                ["info", "-plist", "disk3s1"] => Ok(boot_info(&root_info).into_bytes()),
+                ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+                ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                _ => Err("unexpected command"),
+            },
+            || {
+                boot_reads += 1;
+                Ok(if boot_reads == 1 {
+                    b"/dev/disk3s1\n"
+                } else {
+                    b"/dev/disk3s2\n"
+                }
+                .to_vec())
+            },
+        );
+        assert_eq!(changed_boot, Err("selected boot device changed"));
+        let inconsistent_boot = collect_with(
+            |args| match args {
+                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                ["info", "-plist", "disk3s1"] => Ok(boot_info(&root_info)
+                    .replace("disk0s2", "disk9s2")
+                    .into_bytes()),
+                ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+                ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                _ => Err("unexpected command"),
+            },
+            || Ok(b"/dev/disk3s1\n".to_vec()),
+        );
+        assert_eq!(
+            inconsistent_boot,
+            Err("inconsistent selected boot topology")
+        );
+        assert!(collect_with(
+            |_| Err("diskutil failed"),
+            || Ok(b"/dev/disk3s1\n".to_vec())
+        )
+        .is_err());
+        assert!(collect_with(|_| Err("unexpected command"), || Err("bless failed")).is_err());
+        assert!(selected_boot_id(b"bsdp://255.255.255.255").is_err());
+        assert!(selected_boot_id(b"/dev/disk3s1;command").is_err());
+        assert!(selected_boot_id(b"/dev/disk3s1s1").is_err());
+    }
+
+    #[test]
+    fn excludes_selected_boot_disk_separate_from_root() {
+        let root_info = root("<dict><key>APFSPhysicalStore</key><string>disk0s2</string></dict>");
+        let selected = boot_info(&root_info).replace("disk0s2", "disk4s1");
+        let apfs = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>Containers</key><array>
+            <dict><key>PhysicalStores</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk0s2</string></dict>
+            </array></dict><dict><key>PhysicalStores</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+            </array></dict></array></dict></plist>"#;
+        let list = include_bytes!("../tests/fixtures/diskutil-external.plist");
+        let info = include_bytes!("../tests/fixtures/diskutil-info-external.plist");
+        let result = collect_with(
+            |args| match args {
+                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                ["info", "-plist", "disk3s1"] => Ok(selected.as_bytes().to_vec()),
+                ["info", "-plist", "disk4"] => Ok(info.to_vec()),
+                ["list", "-plist", "external", "physical"] => Ok(list.to_vec()),
+                ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                _ => Err("unexpected command"),
+            },
+            || Ok(b"/dev/disk3s1\n".to_vec()),
+        );
+        assert_eq!(result, Ok(Vec::new()));
     }
 
     #[cfg(target_os = "macos")]
@@ -400,24 +542,28 @@ mod tests {
             ("disk5".into(), info("disk5")),
         ]);
         let mut disk5_reads = 0;
-        let changed_info = collect_with(|args| match args {
-            ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
-            ["list", "-plist", "external", "physical"] => Ok(list.to_vec()),
-            ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
-            ["info", "-plist", "disk4"] => Ok(info("disk4")),
-            ["info", "-plist", "disk5"] => {
-                disk5_reads += 1;
-                let bytes = info("disk5");
-                if disk5_reads == 1 {
-                    Ok(bytes)
-                } else {
-                    Ok(String::from_utf8_lossy(&bytes)
-                        .replace("Example", "Other")
-                        .into_bytes())
+        let changed_info = collect_with(
+            |args| match args {
+                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                ["info", "-plist", "disk3s1"] => Ok(boot_info(&root_info).into_bytes()),
+                ["list", "-plist", "external", "physical"] => Ok(list.to_vec()),
+                ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                ["info", "-plist", "disk4"] => Ok(info("disk4")),
+                ["info", "-plist", "disk5"] => {
+                    disk5_reads += 1;
+                    let bytes = info("disk5");
+                    if disk5_reads == 1 {
+                        Ok(bytes)
+                    } else {
+                        Ok(String::from_utf8_lossy(&bytes)
+                            .replace("Example", "Other")
+                            .into_bytes())
+                    }
                 }
-            }
-            _ => Err("unexpected command"),
-        });
+                _ => Err("unexpected command"),
+            },
+            || Ok(b"/dev/disk3s1\n".to_vec()),
+        );
         assert_eq!(changed_info, Err("external disk metadata changed"));
         let result = screen_external_snapshot(list, list, root_info.as_bytes(), apfs, &disks);
         assert_eq!(
