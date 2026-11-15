@@ -1,13 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 export function App() {
   const [state, setState] = useState<"idle" | "checking" | "done" | "error">(
     "idle",
   );
   const [error, setError] = useState("");
+  const checking = useRef(false);
 
   async function checkDisks() {
+    if (checking.current) return;
+    checking.current = true;
     setState("checking");
     try {
       await invoke("check_disk_discovery");
@@ -19,6 +22,8 @@ export function App() {
           : "The disk check failed. Please try again.",
       );
       setState("error");
+    } finally {
+      checking.current = false;
     }
   }
 
@@ -43,11 +48,12 @@ export function App() {
           <button
             type="button"
             onClick={checkDisks}
-            disabled={state === "checking"}
+            aria-disabled={state === "checking"}
           >
-            {state === "checking" ? "Checking…" : "Check disks"}
+            Check disks
           </button>
-          <div role="status" aria-live="polite">
+          <div role="status">
+            {state === "checking" && <p>Checking disk information…</p>}
             {state === "done" && (
               <p>
                 Disk information was read. Device selection is not available

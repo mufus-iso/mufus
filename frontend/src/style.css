@@ -72,15 +72,16 @@ button {
   font-weight: 600;
   cursor: pointer;
 }
-button:hover:not(:disabled) {
+button:hover:not([aria-disabled="true"]) {
   background: #19463e;
 }
 button:focus-visible {
   outline: 3px solid #498c80;
   outline-offset: 3px;
 }
-button:disabled {
-  opacity: 0.65;
+button[aria-disabled="true"] {
+  border-color: #425c60;
+  background: #425c60;
   cursor: wait;
 }
 .note {
