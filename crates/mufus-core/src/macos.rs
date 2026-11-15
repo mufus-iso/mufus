@@ -10,6 +10,57 @@ fn valid_whole_disk_id(id: &str) -> bool {
     })
 }
 
+fn store_parent(id: &str) -> Result<String, &'static str> {
+    let suffix = id.strip_prefix("disk").ok_or("invalid disk identifier")?;
+    let (number, partition) = suffix.split_once('s').ok_or("invalid disk identifier")?;
+    let disk = format!("disk{number}");
+    if !valid_whole_disk_id(&disk)
+        || partition.is_empty()
+        || (partition.len() > 1 && partition.starts_with('0'))
+        || !partition.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("invalid disk identifier");
+    }
+    Ok(disk)
+}
+
+/// Extract the parent identifiers of every APFS physical store from
+/// `diskutil apfs list -plist`. This conservatively includes non-system stores.
+///
+/// These identifiers do not establish that a device is physical, or that a
+/// device absent from this list is safe. System and boot topology still require
+/// independent verification.
+///
+/// # Errors
+///
+/// Returns an error for malformed containers or ambiguous store identifiers.
+pub fn apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
+    let value = plist::Value::from_reader(Cursor::new(data)).map_err(|_| "invalid plist")?;
+    let containers = value
+        .as_dictionary()
+        .and_then(|list| list.get("Containers"))
+        .and_then(plist::Value::as_array)
+        .ok_or("missing APFS containers")?;
+    let mut parents = BTreeSet::new();
+    for container in containers {
+        let stores = container
+            .as_dictionary()
+            .and_then(|container| container.get("PhysicalStores"))
+            .and_then(plist::Value::as_array)
+            .filter(|stores| !stores.is_empty())
+            .ok_or("missing APFS physical stores")?;
+        for store in stores {
+            let identifier = store
+                .as_dictionary()
+                .and_then(|store| store.get("DeviceIdentifier"))
+                .and_then(plist::Value::as_string)
+                .ok_or("invalid APFS physical store")?;
+            parents.insert(store_parent(identifier)?);
+        }
+    }
+    Ok(parents)
+}
+
 /// Parse whole disk identifiers from `diskutil list -plist external physical`.
 ///
 /// The list is an untrusted snapshot, not proof that a disk is safe to use.
@@ -139,18 +190,7 @@ pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static
                 .and_then(|store| store.get("APFSPhysicalStore"))
                 .and_then(plist::Value::as_string)
                 .ok_or("invalid APFS physical store")?;
-            let suffix = id.strip_prefix("disk").ok_or("invalid disk identifier")?;
-            let (disk, partition) = suffix.split_once('s').ok_or("invalid disk identifier")?;
-            if disk.is_empty()
-                || partition.is_empty()
-                || (disk.len() > 1 && disk.starts_with('0'))
-                || (partition.len() > 1 && partition.starts_with('0'))
-                || !disk.bytes().all(|byte| byte.is_ascii_digit())
-                || !partition.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err("invalid disk identifier");
-            }
-            Ok(format!("disk{disk}"))
+            store_parent(id)
         })
         .collect()
 }
@@ -158,7 +198,8 @@ pub fn root_apfs_store_parents(data: &[u8]) -> Result<BTreeSet<String>, &'static
 #[cfg(test)]
 mod tests {
     use super::{
-        external_disk_info, external_whole_disk_ids, root_apfs_store_parents, ExternalDiskInfo,
+        apfs_store_parents, external_disk_info, external_whole_disk_ids, root_apfs_store_parents,
+        ExternalDiskInfo,
     };
     use std::collections::BTreeSet;
 
@@ -172,6 +213,27 @@ mod tests {
             <key>APFSPhysicalStores</key><array>{stores}</array>
             </dict></plist>"#
         )
+    }
+
+    #[test]
+    fn includes_all_apfs_containers_and_rejects_ambiguous_stores() {
+        let list = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>Containers</key><array>
+        <dict><key>PhysicalStores</key><array>
+        <dict><key>DeviceIdentifier</key><string>disk0s2</string></dict>
+        <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
+        </array></dict>
+        <dict><key>PhysicalStores</key><array>
+        <dict><key>DeviceIdentifier</key><string>disk0s3</string></dict>
+        </array></dict></array></dict></plist>"#;
+        assert_eq!(
+            apfs_store_parents(list.as_bytes()),
+            Ok(["disk0".into(), "disk4".into()].into())
+        );
+        assert!(apfs_store_parents(list.replace("disk4s1", "disk4s1s1").as_bytes()).is_err());
+        assert!(apfs_store_parents(list.replace("PhysicalStores", "Unknown").as_bytes()).is_err());
+        assert!(apfs_store_parents(list.replace("disk0s2", "disk00s2").as_bytes()).is_err());
+        assert!(apfs_store_parents(b"not a plist").is_err());
     }
 
     #[test]
