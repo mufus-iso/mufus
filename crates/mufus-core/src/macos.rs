@@ -293,18 +293,19 @@ fn root_apfs_store_ids(data: &[u8]) -> Result<BTreeSet<String>, &'static str> {
         .and_then(plist::Value::as_array)
         .filter(|stores| !stores.is_empty())
         .ok_or("missing APFS physical stores")?;
-    stores
-        .iter()
-        .map(|store| {
-            let id = store
-                .as_dictionary()
-                .and_then(|store| store.get("APFSPhysicalStore"))
-                .and_then(plist::Value::as_string)
-                .ok_or("invalid APFS physical store")?;
-            store_parent(id)?;
-            Ok(id.to_owned())
-        })
-        .collect()
+    let mut identifiers = BTreeSet::new();
+    for store in stores {
+        let id = store
+            .as_dictionary()
+            .and_then(|store| store.get("APFSPhysicalStore"))
+            .and_then(plist::Value::as_string)
+            .ok_or("invalid APFS physical store")?;
+        store_parent(id)?;
+        if !identifiers.insert(id.to_owned()) {
+            return Err("duplicate APFS physical store");
+        }
+    }
+    Ok(identifiers)
 }
 
 #[cfg(test)]
@@ -517,6 +518,10 @@ mod tests {
         let disks = root_apfs_store_parents(valid.as_bytes());
         assert_eq!(disks, Ok(["disk0".into(), "disk12".into()].into()));
         assert!(root_apfs_store_parents(root("").as_bytes()).is_err());
+        assert!(root_apfs_store_parents(
+            root(&format!("{}{}", store("disk0s2"), store("disk0s2"))).as_bytes()
+        )
+        .is_err());
         assert!(root_apfs_store_parents(root(&store("disk0s2s1")).as_bytes()).is_err());
         assert!(root_apfs_store_parents(root(&store("disk00s2")).as_bytes()).is_err());
         assert!(root_apfs_store_parents(root(&store("disk0s02")).as_bytes()).is_err());
