@@ -3,6 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>DeviceIdentifier</key><string>disk4</string>
+  <key>DeviceNode</key><string>/dev/disk4</string>
   <key>ParentWholeDisk</key><string>disk4</string>
   <key>VirtualOrPhysical</key><string>Physical</string>
   <key>WholeDisk</key><true/>

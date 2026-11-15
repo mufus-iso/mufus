@@ -85,6 +85,17 @@ fn valid_whole_disk_id(id: &str) -> bool {
     })
 }
 
+/// Require `DeviceNode` to match `/dev/<expected>`. Identifiers are reused
+/// after reconnects, so the device node is checked as an additional
+/// consistency signal rather than proof of identity.
+fn device_node_matches(info: &plist::Dictionary, expected: &str) -> Result<(), &'static str> {
+    let node = format!("/dev/{expected}");
+    if info.get("DeviceNode").and_then(plist::Value::as_string) != Some(node.as_str()) {
+        return Err("inconsistent device node");
+    }
+    Ok(())
+}
+
 fn store_parent(id: &str) -> Result<String, &'static str> {
     let suffix = id.strip_prefix("disk").ok_or("invalid disk identifier")?;
     let (number, partition) = suffix.split_once('s').ok_or("invalid disk identifier")?;
@@ -318,6 +329,7 @@ pub fn external_disk_info(data: &[u8], expected: &str) -> Result<ExternalDiskInf
     let info = value.as_dictionary().ok_or("invalid disk information")?;
     let string = |key: &str| info.get(key).and_then(plist::Value::as_string);
     let boolean = |key: &str| info.get(key).and_then(plist::Value::as_boolean);
+    device_node_matches(info, expected)?;
     if string("DeviceIdentifier") != Some(expected)
         || string("ParentWholeDisk") != Some(expected)
         || string("VirtualOrPhysical") != Some("Physical")
@@ -416,6 +428,7 @@ fn volume_uuid(data: &[u8]) -> Result<String, &'static str> {
 fn boot_apfs_store_ids(data: &[u8], expected: &str) -> Result<BTreeSet<String>, &'static str> {
     let value = parse_plist(data)?;
     let info = value.as_dictionary().ok_or("invalid boot information")?;
+    device_node_matches(info, expected)?;
     if info
         .get("DeviceIdentifier")
         .and_then(plist::Value::as_string)
@@ -465,6 +478,7 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
             <plist version="1.0"><dict>
             <key>MountPoint</key><string>/</string>
+            <key>DeviceNode</key><string>/dev/disk3s1s1</string>
             <key>VolumeUUID</key><string>11111111-1111-1111-1111-111111111111</string>
             <key>FilesystemType</key><string>apfs</string>
             <key>RAIDMaster</key><false/><key>RAIDSlice</key><false/>
@@ -474,10 +488,15 @@ mod tests {
     }
 
     fn boot_info(root_info: &str) -> String {
-        root_info.replace(
-            "<key>MountPoint</key>",
-            "<key>DeviceIdentifier</key><string>disk3s1</string><key>MountPoint</key>",
-        )
+        root_info
+            .replace(
+                "<key>MountPoint</key>",
+                "<key>DeviceIdentifier</key><string>disk3s1</string><key>MountPoint</key>",
+            )
+            .replace(
+                "<key>DeviceNode</key><string>/dev/disk3s1s1</string>",
+                "<key>DeviceNode</key><string>/dev/disk3s1</string>",
+            )
     }
 
     #[test]
@@ -608,6 +627,22 @@ mod tests {
             inconsistent_boot,
             Err("inconsistent selected boot topology")
         );
+        let wrong_node = collect_with(
+            |args| match args {
+                ["info", "-plist", "/"] => Ok(root_info.as_bytes().to_vec()),
+                ["info", "-plist", "disk3s1"] => Ok(boot_info(&root_info)
+                    .replace(
+                        "<string>/dev/disk3s1</string>",
+                        "<string>/dev/disk3</string>",
+                    )
+                    .into_bytes()),
+                ["list", "-plist", "external", "physical"] => Ok(empty.to_vec()),
+                ["apfs", "list", "-plist"] => Ok(apfs.to_vec()),
+                _ => Err("unexpected command"),
+            },
+            || Ok(b"/dev/disk3s1\n".to_vec()),
+        );
+        assert_eq!(wrong_node, Err("inconsistent device node"));
         assert!(collect_with(
             |_| Err("diskutil failed"),
             || Ok(b"/dev/disk3s1\n".to_vec())
@@ -747,6 +782,7 @@ mod tests {
         let info = |id| {
             format!(r#"<?xml version="1.0"?><plist version="1.0"><dict>
             <key>DeviceIdentifier</key><string>{id}</string><key>ParentWholeDisk</key><string>{id}</string>
+            <key>DeviceNode</key><string>/dev/{id}</string>
             <key>VirtualOrPhysical</key><string>Physical</string><key>WholeDisk</key><true/>
             <key>Internal</key><false/><key>RAIDMaster</key><false/><key>RAIDSlice</key><false/>
             <key>MediaName</key><string>Example</string><key>BusProtocol</key><string>USB</string>
@@ -912,6 +948,7 @@ mod tests {
         let info = r#"<?xml version="1.0" encoding="UTF-8"?>
         <plist version="1.0"><dict>
         <key>DeviceIdentifier</key><string>disk4</string>
+        <key>DeviceNode</key><string>/dev/disk4</string>
         <key>ParentWholeDisk</key><string>disk4</string>
         <key>VirtualOrPhysical</key><string>Physical</string>
         <key>WholeDisk</key><true/><key>Internal</key><false/>
@@ -950,6 +987,18 @@ mod tests {
         )
         .is_err());
         assert!(external_disk_info(info.replace("30943995904", "0").as_bytes(), "disk4").is_err());
+        assert!(external_disk_info(
+            info.replace("<string>/dev/disk4</string>", "<string>/dev/disk5</string>")
+                .as_bytes(),
+            "disk4"
+        )
+        .is_err());
+        assert!(external_disk_info(
+            info.replace("<key>DeviceNode</key><string>/dev/disk4</string>", "")
+                .as_bytes(),
+            "disk4"
+        )
+        .is_err());
         assert!(external_disk_info(b"not a plist", "disk4").is_err());
     }
 }

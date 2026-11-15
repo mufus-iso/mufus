@@ -3,6 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>MountPoint</key><string>/</string>
+  <key>DeviceNode</key><string>/dev/disk3s1s1</string>
   <key>FilesystemType</key><string>apfs</string>
   <key>RAIDMaster</key><false/>
   <key>RAIDSlice</key><false/>
