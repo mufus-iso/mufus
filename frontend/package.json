@@ -17,6 +17,11 @@
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.8"
+    }
+  },
   "devDependencies": {
     "@tauri-apps/cli": "2.12.4",
     "@testing-library/react": "^16.3.3",

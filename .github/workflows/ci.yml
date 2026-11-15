@@ -26,6 +26,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: npm ci --prefix frontend
+      - run: npm audit --prefix frontend --audit-level=moderate
       - run: npm run lint --prefix frontend
       - run: npm run format:check --prefix frontend
       - run: npm run test --prefix frontend

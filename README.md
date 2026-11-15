@@ -18,9 +18,12 @@ npm run lint --prefix frontend
 npm run format:check --prefix frontend
 npm run test --prefix frontend
 npm run build --prefix frontend
+npm audit --prefix frontend --audit-level=moderate
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace
 ```
+
+The frontend temporarily overrides `typescript-estree`'s `minimatch` dependency to version 11 to address GHSA-g3hv-75wg-m249. Remove the override when upstream supports a patched version; the override crosses the upstream major-version range and must be rechecked when dependencies change.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development and disk-testing rules. Licensed under [MIT](LICENSE).
