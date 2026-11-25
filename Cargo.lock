@@ -1858,6 +1858,7 @@ name = "mufus-core"
 version = "0.1.0"
 dependencies = [
  "plist",
+ "sha2",
  "wait-timeout",
 ]
 

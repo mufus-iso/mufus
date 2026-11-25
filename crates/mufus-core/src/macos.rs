@@ -301,13 +301,18 @@ fn collect_with(
     {
         return Err("APFS volume changed");
     }
-    if root_apfs_store_ids(&root)? != root_apfs_store_ids(&final_root)?
-        || apfs_store_ids(&apfs)? != apfs_store_ids(&final_apfs)?
-        || boot_apfs_store_ids(&boot_info, &boot)? != boot_apfs_store_ids(&final_boot_info, &boot)?
-    {
+    if root_apfs_store_ids(&root)? != root_apfs_store_ids(&final_root)? {
         return Err("APFS topology changed");
     }
-    if !boot_apfs_store_ids(&boot_info, &boot)?.is_subset(&apfs_store_ids(&apfs)?) {
+    let stores = apfs_store_ids(&apfs)?;
+    if stores != apfs_store_ids(&final_apfs)? {
+        return Err("APFS topology changed");
+    }
+    let boot_stores = boot_apfs_store_ids(&boot_info, &boot)?;
+    if boot_stores != boot_apfs_store_ids(&final_boot_info, &boot)? {
+        return Err("APFS topology changed");
+    }
+    if !boot_stores.is_subset(&stores) {
         return Err("inconsistent selected boot topology");
     }
     screen_external_snapshot(&initial, &final_list, &root, &apfs, &disk_info)
@@ -643,6 +648,10 @@ mod tests {
             || Ok(b"/dev/disk3s1\n".to_vec()),
         );
         assert_eq!(wrong_node, Err("inconsistent device node"));
+    }
+
+    #[test]
+    fn collector_rejects_command_failures_and_invalid_boot_ids() {
         assert!(collect_with(
             |_| Err("diskutil failed"),
             || Ok(b"/dev/disk3s1\n".to_vec())
